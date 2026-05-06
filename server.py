@@ -9,25 +9,33 @@ import csv
 import io
 from queue import Queue, Empty
 from collections import deque
-from ultralytics import YOLO
+from ultralytics import YOLO  # YOLOv8 object detection library by Ultralytics
 from datetime import datetime
 
+# Flask web framework powers the HTTP server and all API endpoints
 app = Flask(__name__)
 
 # =========================
 # MODEL SETUP
+# Uses YOLOv8n (nano) — the lightest YOLOv8 variant for real-time inference
 # =========================
+# Load the YOLOv8 nano model; downloads weights automatically on first run
 model = YOLO("yolov8n.pt")
+# Resize input to 320x320 for faster YOLOv8 inference with minimal accuracy loss
 model.overrides["imgsz"] = 320
 
+# Warm up the YOLOv8 model with a dummy frame so the first real inference isn't slow
 dummy = np.zeros((320, 320, 3), dtype=np.uint8)
 model(dummy, verbose=False)
 print("[EYECORE] Neural model initialized.")
 
+# MJPEG stream URL — YOLOv8 will run detection on frames pulled from this camera feed
 STREAM_URL = "http://10.181.135.37/1280x1024.mjpeg"
 
 # =========================
 # EXTENDED CATEGORY MAP
+# Maps raw YOLOv8 COCO class names to broader display categories
+# YOLOv8 is trained on the COCO dataset (80 classes); we group them here
 # =========================
 CATEGORY_MAP = {
     "person":       "person",
@@ -57,82 +65,97 @@ CATEGORY_MAP = {
     "tv":           "object",
 }
 
+# All display categories shown in the Flask UI dashboard
 ALL_CATEGORIES = [
     "person", "vehicle", "animal", "bicycle",
     "bag", "phone", "weapon", "umbrella",
     "infra", "furniture", "object", "others"
 ]
 
+# Alert thresholds: Flask will send an alert event when YOLOv8 detects
+# this many objects of a given category in a single frame
 ALERT_THRESHOLDS = {
     "person":  5,
-    "weapon":  1,
+    "weapon":  1,  # Any weapon detection triggers an immediate alert
     "vehicle": 4,
 }
 
 # =========================
 # SHARED STATE
+# Thread-safe data shared between the YOLOv8 worker thread and Flask routes
 # =========================
-data_lock = threading.Lock()
-frame_lock = threading.Lock()
+data_lock = threading.Lock()   # Protects shared_data dict (detection counts)
+frame_lock = threading.Lock()  # Protects the latest JPEG frame bytes
 
+# Live detection counts updated by the YOLOv8 worker and read by Flask /counts
 shared_data = {cat: 0 for cat in ALL_CATEGORIES}
 shared_data["fps"] = 0
 shared_data["total_detections"] = 0
 
-latest_frame = None
-latest_annotated = None
+latest_frame = None      # Raw MJPEG frame (no annotations)
+latest_annotated = None  # YOLOv8-annotated frame with bounding boxes drawn
 
+# Queue passes raw camera frames from the stream thread to the YOLOv8 worker
 frame_queue = Queue(maxsize=2)
 
+# Rolling history of detection snapshots served by the Flask /history endpoint
 MAX_HISTORY = 500
 detection_history = deque(maxlen=MAX_HISTORY)
 history_lock = threading.Lock()
 
+# Per-frame object list (label, category, confidence, bbox) from YOLOv8
 confidence_list = []
 conf_lock = threading.Lock()
 
+# Cooldown tracker so the same alert category doesn't fire repeatedly
 alert_state = {}
-ALERT_COOLDOWN = 10
+ALERT_COOLDOWN = 10  # seconds between repeat alerts for the same category
 
 frame_count = 0
 fps_start = time.time()
 
 last_inference_time = 0
-INFERENCE_INTERVAL = 0.2
+INFERENCE_INTERVAL = 0.2  # Run YOLOv8 inference at most 5 times per second
 
 
 # =========================
 # YOLO WORKER
+# Background thread that runs YOLOv8 inference on frames from the queue.
+# Results are written to shared state and read by Flask API routes.
 # =========================
 def yolo_worker():
     global latest_annotated, last_inference_time
 
     while True:
+        # Block until a frame is available from the camera stream thread
         try:
             frame = frame_queue.get(timeout=1)
         except Empty:
             continue
 
+        # Throttle YOLOv8 inference to INFERENCE_INTERVAL seconds per frame
         now = time.time()
         if now - last_inference_time < INFERENCE_INTERVAL:
             continue
         last_inference_time = now
 
+        # Run YOLOv8 detection — conf=0.4 filters out low-confidence predictions
         results = model(frame, conf=0.4, verbose=False)
 
+        # Tally detections by category using the COCO-to-category map
         counts = {cat: 0 for cat in ALL_CATEGORIES}
         obj_list = []
         total = 0
 
         for r in results:
             for box in r.boxes:
-                conf = float(box.conf[0])
-                cls = int(box.cls[0])
-                name = model.names[cls]
-                category = CATEGORY_MAP.get(name, "others")
+                conf = float(box.conf[0])          # YOLOv8 confidence score (0–1)
+                cls = int(box.cls[0])               # YOLOv8 COCO class index
+                name = model.names[cls]             # Human-readable COCO class name
+                category = CATEGORY_MAP.get(name, "others")  # Map to display category
                 counts[category] += 1
                 total += 1
-                xyxy = box.xyxy[0].tolist()
+                xyxy = box.xyxy[0].tolist()  # Bounding box in [x1,y1,x2,y2] format
                 obj_list.append({
                     "label": name,
                     "category": category,
@@ -140,6 +163,7 @@ def yolo_worker():
                     "bbox": [round(x, 1) for x in xyxy]
                 })
 
+        # Check alert thresholds and fire events if exceeded (with cooldown)
         ts = datetime.now().strftime("%H:%M:%S")
         alerts_fired = []
         for cat, threshold in ALERT_THRESHOLDS.items():
@@ -156,15 +180,18 @@ def yolo_worker():
                         "message": f"{cat.upper()} threshold exceeded: {counts[cat]}"
                     })
 
+        # Update shared counts read by the Flask /counts endpoint
         with data_lock:
             for cat in ALL_CATEGORIES:
                 shared_data[cat] = counts[cat]
             shared_data["total_detections"] = total
 
+        # Update per-object confidence list read by Flask /confidences
         with conf_lock:
             confidence_list.clear()
             confidence_list.extend(obj_list)
 
+        # Append detection snapshot and any alerts to the rolling history
         snapshot = {
             "time": ts,
             "timestamp": now,
@@ -177,6 +204,8 @@ def yolo_worker():
             for alert in alerts_fired:
                 detection_history.append(alert)
 
+        # Use YOLOv8's built-in plot() to draw bounding boxes on the frame,
+        # then JPEG-encode it for streaming via the Flask /video endpoint
         annotated = results[0].plot()
         _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
         with frame_lock:
@@ -185,6 +214,8 @@ def yolo_worker():
 
 # =========================
 # STREAM THREAD
+# Pulls MJPEG frames from the IP camera and feeds them to the YOLOv8 worker.
+# Runs as a daemon thread alongside the Flask server.
 # =========================
 def detection_loop():
     global latest_frame, frame_count, fps_start
@@ -192,11 +223,13 @@ def detection_loop():
     while True:
         try:
             print("[EYECORE] Connecting to retinal feed...")
+            # Use requests to consume the MJPEG stream as a chunked HTTP response
             stream = requests.get(STREAM_URL, stream=True, timeout=10)
             buf = b""
 
             for chunk in stream.iter_content(chunk_size=4096):
                 buf += chunk
+                # MJPEG frames are delimited by JPEG SOI (0xFFD8) and EOI (0xFFD9) markers
                 a = buf.find(b'\xff\xd8')
                 b = buf.find(b'\xff\xd9')
 
@@ -204,6 +237,7 @@ def detection_loop():
                     jpg = buf[a:b+2]
                     buf = buf[b+2:]
 
+                    # Decode JPEG bytes into an OpenCV BGR frame
                     frame = cv2.imdecode(
                         np.frombuffer(jpg, dtype=np.uint8),
                         cv2.IMREAD_COLOR
@@ -211,14 +245,17 @@ def detection_loop():
                     if frame is None:
                         continue
 
+                    # Resize to 640x480 before queuing for YOLOv8 inference
                     resized = cv2.resize(frame, (640, 480))
                     if not frame_queue.full():
                         frame_queue.put(resized)
 
+                    # Also store the raw (unannotated) frame as fallback for /video
                     _, raw_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     with frame_lock:
                         latest_frame = raw_buf.tobytes()
 
+                    # Track frames per second and expose via shared_data for Flask /counts
                     frame_count += 1
                     if time.time() - fps_start >= 1:
                         with data_lock:
@@ -228,29 +265,36 @@ def detection_loop():
 
         except Exception as e:
             print(f"[EYECORE ERROR] {e}")
-            time.sleep(3)
+            time.sleep(3)  # Back off before reconnecting to the camera stream
 
 
 # =========================
 # VIDEO GENERATOR
+# Generator function used by the Flask /video route to stream MJPEG over HTTP.
+# Yields the latest YOLOv8-annotated frame (or raw frame if inference is pending).
 # =========================
 def gen_frames():
     last = None
     while True:
+        # Prefer the YOLOv8-annotated frame; fall back to raw if not yet available
         with frame_lock:
             frame = latest_annotated or latest_frame
 
         if frame is None or frame is last:
-            time.sleep(0.033)
+            time.sleep(0.033)  # ~30 fps cap; avoid busy-waiting
             continue
 
         last = frame
+        # Flask streams this as a multipart/x-mixed-replace MJPEG response
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
 
 # =========================
 # HTML — EYECORE UI
+# Single-page dashboard served by Flask at the root route.
+# Polls Flask JSON endpoints (/counts, /confidences, /history) every 800ms
+# and renders live YOLOv8 stats using Chart.js.
 # =========================
 HTML = r"""
 <!DOCTYPE html>
@@ -260,6 +304,7 @@ HTML = r"""
 <title>EYECORE — Neural Vision System</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600&display=swap" rel="stylesheet">
+<!-- Chart.js renders the live YOLOv8 detection count graph in the dashboard -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 
 <style>
@@ -918,6 +963,7 @@ header::after {
 
 <!-- EXPORT MENU -->
 <div id="export-menu">
+  <!-- Exports the YOLOv8 detection history logged by Flask to CSV or JSON -->
   <button class="btn" onclick="exportCSV()">Export CSV</button>
   <button class="btn" onclick="exportJSON()">Export JSON</button>
 </div>
@@ -928,7 +974,7 @@ header::after {
   <!-- LEFT -->
   <div class="left-col">
 
-    <!-- VIDEO PANEL -->
+    <!-- VIDEO PANEL — streams YOLOv8-annotated MJPEG from Flask /video -->
     <div class="panel">
       <div class="panel-hdr">
         <span class="panel-title">◉ RETINAL FEED — NODE 01</span>
@@ -944,7 +990,7 @@ header::after {
       </div>
     </div>
 
-    <!-- TILES -->
+    <!-- TILES — per-category counts from YOLOv8 via Flask /counts -->
     <div class="tiles-bar" id="tiles-bar"></div>
 
   </div>
@@ -952,7 +998,7 @@ header::after {
   <!-- RIGHT -->
   <div class="right-col">
 
-    <!-- CHART -->
+    <!-- CHART — plots YOLOv8 detection counts over time using Chart.js -->
     <div class="panel chart-panel">
       <div class="panel-hdr">
         <span class="panel-title">NEURAL ACTIVITY</span>
@@ -963,7 +1009,7 @@ header::after {
       </div>
     </div>
 
-    <!-- CONFIDENCE TABLE -->
+    <!-- CONFIDENCE TABLE — shows per-object YOLOv8 scores from Flask /confidences -->
     <div class="panel conf-panel">
       <div class="panel-hdr">
         <span class="panel-title">OBJECT RECOGNITION</span>
@@ -974,7 +1020,7 @@ header::after {
       </div>
     </div>
 
-    <!-- HISTORY -->
+    <!-- HISTORY — scrolling log of YOLOv8 detection events and alerts from Flask /history -->
     <div class="panel hist-panel">
       <div class="panel-hdr">
         <span class="panel-title">EVENT MEMBRANE</span>
@@ -991,22 +1037,26 @@ header::after {
 
 <script>
 // ── CONFIG ──
+// Category and color config mirrors the YOLOv8 CATEGORY_MAP defined in Python
 const CATS = ["person","vehicle","animal","bicycle","bag","phone","weapon","umbrella","infra","furniture","object","others"];
 const COLORS = {
   person:"#00ffcc",  vehicle:"#0af0ff",  animal:"#ff9f0a",  bicycle:"#ff66cc",
   bag:"#bf5af2",     phone:"#ffd60a",    weapon:"#ff2d55",  umbrella:"#64d2ff",
   infra:"#98989e",   furniture:"#6e6e73", object:"#d1b97a", others:"#3a5a7a"
 };
+// Must match ALERT_THRESHOLDS in Python so the UI reflects the same logic
 const ALERT_CATS = { person:5, weapon:1, vehicle:4 };
+// Subset of categories plotted on the Chart.js live graph
 const CHART_CATS = ['person','vehicle','weapon','animal'];
 
 let muted = false;
 let uptime = 0;
 let lastCounts = {};
-let localHistory = [];
-let lastHistTime = 0;
+let localHistory = [];   // Client-side cache of YOLOv8 detection history
+let lastHistTime = 0;    // Timestamp cursor for incremental Flask /history fetches
 
 // ── AUDIO ──
+// Plays an alert tone when YOLOv8 detects an above-threshold category
 let audioCtx;
 function beep(freq, dur, type='sine') {
   if (muted) return;
@@ -1033,6 +1083,7 @@ function toggleMute() {
 }
 
 // ── EXPORT ──
+// Exports the locally cached YOLOv8 detection history to CSV or JSON
 function toggleExport() {
   document.getElementById('export-menu').classList.toggle('open');
 }
@@ -1058,6 +1109,7 @@ function dl(name, content, type) {
 }
 
 // ── CHART ──
+// Chart.js line chart showing live YOLOv8 detection counts for key categories
 const chart = new Chart(document.getElementById('chart'), {
   type: 'line',
   data: {
@@ -1092,6 +1144,7 @@ const chart = new Chart(document.getElementById('chart'), {
 });
 
 // ── BUILD TILES ──
+// Dynamically generates one tile per YOLOv8 category; counts updated by poll()
 function buildTiles() {
   const bar = document.getElementById('tiles-bar');
   bar.innerHTML = '';
@@ -1104,9 +1157,8 @@ function buildTiles() {
       <div class="tile-val" id="tv-${cat}" style="color:${COLORS[cat]};text-shadow:0 0 10px ${COLORS[cat]}66">0</div>
       <div class="tile-delta" id="td-${cat}"></div>
     `;
-    // Bottom bar color
     d.style.setProperty('--bc', COLORS[cat]);
-    d.querySelector('.tile-val'); // just init
+    d.querySelector('.tile-val');
     const bar2 = document.createElement('div');
     bar2.style.cssText = `position:absolute;bottom:0;left:0;right:0;height:2px;background:${COLORS[cat]};opacity:0.3;border-radius:0 0 4px 4px;`;
     d.appendChild(bar2);
@@ -1116,6 +1168,7 @@ function buildTiles() {
 buildTiles();
 
 // ── BUILD BADGES ──
+// Overlaid on the YOLOv8 video feed; shows live per-category counts
 function buildBadges() {
   const wrap = document.getElementById('video-badges');
   wrap.innerHTML = '';
@@ -1131,6 +1184,7 @@ buildBadges();
 // ── HISTORY ──
 const histBody = document.getElementById('hist-body');
 
+// Prepends new YOLOv8 detection/alert events returned by Flask /history
 function appendHistory(events) {
   if (!events.length) return;
   if (histBody.querySelector('div[style]')) histBody.innerHTML = '';
@@ -1151,6 +1205,7 @@ function appendHistory(events) {
 }
 
 // ── CONFIDENCE ──
+// Renders per-object YOLOv8 confidence scores from Flask /confidences
 function updateConf(objs) {
   document.getElementById('obj-count').textContent = objs.length + ' TARGETS';
   const body = document.getElementById('conf-body');
@@ -1158,6 +1213,7 @@ function updateConf(objs) {
     body.innerHTML = '<div style="color:var(--dim);font-family:var(--font-eye);font-size:8px;padding:10px;letter-spacing:2px;">NO TARGETS ACQUIRED...</div>';
     return;
   }
+  // Sort by descending YOLOv8 confidence, show top 20
   const sorted = [...objs].sort((a,b)=>b.confidence-a.confidence).slice(0,20);
   body.innerHTML = sorted.map(o => {
     const pct = Math.round(o.confidence*100);
@@ -1177,6 +1233,7 @@ function updateConf(objs) {
 }
 
 // ── ALERTS ──
+// Client-side mirror of the server-side YOLOv8 alert threshold logic
 let activeAlerts = new Set();
 function checkAlerts(counts) {
   let any = false;
@@ -1198,6 +1255,10 @@ function checkAlerts(counts) {
 }
 
 // ── POLL ──
+// Hits three Flask endpoints every 800ms to keep the dashboard live:
+//   /counts      — YOLOv8 per-category detection counts + FPS
+//   /confidences — per-object YOLOv8 confidence scores and bounding boxes
+//   /history     — new detection/alert events since last poll
 async function poll() {
   try {
     const [cRes, confRes, hRes] = await Promise.all([
@@ -1209,13 +1270,13 @@ async function poll() {
     const conf   = await confRes.json();
     const hist   = await hRes.json();
 
-    // HUD
+    // Update HUD with YOLOv8 FPS and total object count
     document.getElementById('status').textContent = 'ACTIVE';
     document.getElementById('status').className = 'val online';
     document.getElementById('fps').textContent = counts.fps || '—';
     document.getElementById('total').textContent = counts.total_detections || 0;
 
-    // Tiles
+    // Update category tiles with latest YOLOv8 counts and delta indicators
     CATS.forEach(cat => {
       const val = counts[cat]||0;
       const prev = lastCounts[cat]||0;
@@ -1229,14 +1290,14 @@ async function poll() {
       tile.className = 'tile'+(isAlert?' alert':'');
     });
 
-    // Badges
+    // Update video overlay badges with latest YOLOv8 counts
     ['person','vehicle','weapon','animal','bag','phone'].forEach(cat => {
       const val = counts[cat]||0;
       document.getElementById('vbv-'+cat).textContent = val;
       document.getElementById('vb-'+cat).className = `vbadge ${cat}${val===0?' zero':''}`;
     });
 
-    // Chart
+    // Append new YOLOv8 data points to the Chart.js rolling window (last 30 frames)
     chart.data.labels.push('');
     CHART_CATS.forEach((cat,i) => {
       chart.data.datasets[i].data.push(counts[cat]||0);
@@ -1245,10 +1306,10 @@ async function poll() {
     if (chart.data.labels.length > 30) chart.data.labels.shift();
     chart.update('none');
 
-    // Confidence
+    // Render per-object YOLOv8 confidence scores
     updateConf(conf.objects||[]);
 
-    // History
+    // Append new Flask history events (detections + alerts) to the log panel
     if (hist.events?.length) {
       localHistory.push(...hist.events);
       appendHistory(hist.events);
@@ -1259,6 +1320,7 @@ async function poll() {
     lastCounts = {...counts};
 
   } catch(e) {
+    // Flask server unreachable — show OFFLINE status
     document.getElementById('status').textContent = 'OFFLINE';
     document.getElementById('status').className = 'val offline';
   }
@@ -1277,6 +1339,7 @@ setInterval(() => {
     .map(n=>String(n).padStart(2,'0')).join(':');
 }, 1000);
 
+// Poll Flask endpoints every 800ms for fresh YOLOv8 detection data
 setInterval(poll, 800);
 poll();
 </script>
@@ -1286,28 +1349,35 @@ poll();
 
 
 # =========================
-# ROUTES
+# FLASK ROUTES
+# All routes are served by Flask; data originates from the YOLOv8 worker thread
 # =========================
+
 @app.route('/')
 def index():
+    # Serves the single-page dashboard HTML (polls YOLOv8 data via JSON endpoints)
     return render_template_string(HTML)
 
 @app.route('/video')
 def video():
+    # Streams YOLOv8-annotated frames as a multipart MJPEG response
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/counts')
 def counts():
+    # Returns latest per-category YOLOv8 detection counts and FPS as JSON
     with data_lock:
         return jsonify(shared_data)
 
 @app.route('/confidences')
 def confidences():
+    # Returns per-object YOLOv8 detection details (label, category, confidence, bbox)
     with conf_lock:
         return jsonify({"objects": list(confidence_list)})
 
 @app.route('/history')
 def history():
+    # Returns YOLOv8 detection/alert events newer than the `since` timestamp
     since = float(request.args.get('since', 0))
     with history_lock:
         events = [e for e in detection_history if e.get('timestamp', 0) > since]
@@ -1316,6 +1386,7 @@ def history():
 
 @app.route('/export/csv')
 def export_csv():
+    # Server-side CSV export of the full YOLOv8 detection history (Flask route)
     with history_lock:
         rows = list(detection_history)
     output = io.StringIO()
@@ -1332,6 +1403,7 @@ def export_csv():
 
 @app.route('/export/json')
 def export_json():
+    # Server-side JSON export of the full YOLOv8 detection history (Flask route)
     with history_lock:
         rows = list(detection_history)
     return Response(json.dumps(rows, indent=2), mimetype='application/json',
@@ -1340,6 +1412,9 @@ def export_json():
 
 # =========================
 # START
+# Launches background threads then starts the Flask dev server.
+# Thread 1: yolo_worker  — runs YOLOv8 inference and writes results to shared state
+# Thread 2: detection_loop — pulls MJPEG frames from the camera and feeds the queue
 # =========================
 if __name__ == '__main__':
     threading.Thread(target=yolo_worker, daemon=True).start()
